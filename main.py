@@ -5,15 +5,21 @@ reply per batch on stdout). Long/flat spot, at most one position.
 
 Strategy (v3, built from dev-window evidence):
   - Entry is an EVENT, not a level: the fast EMA crosses above the slow
-    EMA within the last few bars, the close is above the long trend SMA,
-    RSI sits in a healthy momentum band, and the close confirms with a
-    break of the recent short high. Event entries cannot re-fire every
-    few bars in sideways chop the way level checks do.
+    EMA within the last few bars, the close is above the long trend SMA
+    (and above a second, 360-bar trend SMA once enough history exists,
+    which keeps counter-trend bounces in a falling market out), RSI sits
+    in a healthy momentum band, and the close confirms by breaking the
+    recent short high by a clear margin (0.1%), so marginal range-top
+    breakouts do not trigger. Event entries cannot re-fire every few
+    bars in sideways chop the way level checks do.
   - Exits are deliberately SLOWER than entries (the dev window punishes
     twitchy exits with fee bleed): a fall back under the slow EMA held
     for several consecutive bars, a close under the trend SMA with
     momentum rolled over, a percent hard stop under the entry, or a
-    percent trailing stop under the running peak once in profit.
+    percent trailing stop under the running peak once in profit. The
+    one fast exit is a failed-breakout cut: a close 0.35% under the
+    entry within the first 20 bars ends the trade at once, so a
+    breakout that does not follow through costs a little, not a lot.
   - Risk: an equity drawdown breaker stops new entries after a deep
     drawdown from the peak (the race bars entries above 25%); a harder
     floor exits and locks out entirely. A cooldown follows every exit.
@@ -35,9 +41,15 @@ RSI_MIN = 45.0
 RSI_MAX = 80.0
 CROSS_WINDOW = 3      # entry allowed this many bars after the cross up
 CONFIRM_N = 20        # close must break the previous CONFIRM_N bars' high
+BREAK_MARGIN_PCT = 0.001  # breakout must clear the recent high by this margin
+TREND_SMA2 = 360      # second, longer trend SMA the close must sit above (0 = off)
+FAIL_BARS = 20        # failed-breakout exit window after entry (0 = off)
+FAIL_PCT = 0.0035     # exit if the close falls this far under the entry early on
 SLOPE_BARS = 30       # trend SMA must rise over this lookback to enter
-SLOPE_MIN_PCT = 0.0008  # minimum SMA rise over SLOPE_BARS (fraction)
-GAP_MIN_PCT = 0.0003  # minimum EMA fast-slow gap at entry (fraction of price)
+SLOPE_MIN_PCT = 0.0   # SMA slope gate OFF: redundant once the breakout
+                      # margin + 360-bar trend filter landed (sim identical
+                      # with it on or off on dev/rotated/inverted windows)
+GAP_MIN_PCT = 0.00015  # minimum EMA fast-slow gap at entry (fraction of price)
 ENTRY_EDGE = 0        # 1: enter on the rising edge of the full condition set
 REGIME_SLOPE_PCT = 0.0015  # at/above this SMA slope, level entries are allowed
 ROC_BARS = 60         # momentum lookback for the optional ROC entry filter
@@ -49,6 +61,10 @@ TRAIL_PCT = 0.025     # trailing stop distance under the peak
 PROFIT_LOCK_PCT = 0.01  # once the peak gain passes this, signal exits switch off
 SIZE_FRAC = 0.97      # fraction of cash spent per entry
 INIT_FRAC = 0.90      # first tranche of an entry (fraction of cash)
+MAX_EXPOSURE = 1.0    # cap on total position cost as a fraction of equity
+VOL_ADJ = 0           # 1: scale MAX_EXPOSURE down when recent bar ranges run hot
+VOL_REF = 0.0006      # reference mean (high-low)/close over the last 20 bars
+VOL_FLOOR = 0.4       # lowest exposure multiplier the vol scaler may reach
 ADD_GAINS = (0.004, 0.010)  # gains at which the two add-on tranches buy
 ADD_DELAY = 10        # ... and at least this many bars after entry
 TP_STEPS = (0.010, 0.018)  # peak gains at which partial profits are taken
@@ -81,6 +97,7 @@ class Bot:
     def __init__(self):
         self.closes = []
         self.highs = []
+        self.ranges = []
         self.ema_fast = Ema(EMA_FAST)
         self.ema_slow = Ema(EMA_SLOW)
         self.sma_sum = 0.0
@@ -108,11 +125,21 @@ class Bot:
         self.bar_no = -1
 
     # -- indicators ------------------------------------------------------
+    def exposure_cap(self, equity):
+        cap = MAX_EXPOSURE
+        if VOL_ADJ and len(self.ranges) >= 20:
+            vol = sum(self.ranges[-20:]) / 20
+            if vol > 0:
+                cap = MAX_EXPOSURE * min(1.0, max(VOL_FLOOR, VOL_REF / vol))
+        return int(equity * cap)
+
     def step_indicators(self, bar):
         c = int(bar["c"])
         h = int(bar["h"])
         self.closes.append(c)
         self.highs.append(h)
+        if c > 0:
+            self.ranges.append((h - int(bar["l"])) / c)
         self.sma_sum += c
         if len(self.closes) > TREND_SMA:
             self.sma_sum -= self.closes[-TREND_SMA - 1]
@@ -211,6 +238,10 @@ class Bot:
                 self.under_slow = 0
             held_bars = self.bar_no - self.entry_bar
             stop_hit = close <= self.entry_price * (1.0 - STOP_PCT)
+            fail_hit = (
+                FAIL_BARS > 0 and held_bars <= FAIL_BARS
+                and close <= self.entry_price * (1.0 - FAIL_PCT)
+            )
             trail_hit = (
                 self.peak_price is not None
                 and self.peak_price >= self.entry_price * (1.0 + TRAIL_ACT_PCT)
@@ -227,7 +258,7 @@ class Bot:
                 and ef is not None and es is not None and ef < es
                 and not in_profit_lock
             )
-            if stop_hit or trail_hit or ema_exit or trend_exit or self.locked:
+            if stop_hit or fail_hit or trail_hit or ema_exit or trend_exit or self.locked:
                 return [{"side": "sell", "symbol": SYMBOL, "qty": str(held[0]),
                          "max_slippage_bps": MAX_SLIPPAGE_BPS}]
             # partial take-profits: bank a third at each peak-gain step
@@ -243,7 +274,9 @@ class Bot:
                     and close >= self.entry_price * (1.0 + ADD_GAINS[self.adds_done])
                     and ef is not None and es is not None and ef > es):
                 frac = 0.5 if self.adds_done == 0 else SIZE_FRAC
-                notional = int(state_cash * frac)
+                # position value at the latest close is equity minus cash
+                room = self.exposure_cap(state_equity) - (state_equity - state_cash)
+                notional = min(int(state_cash * frac), room)
                 if notional >= 1_000_000:
                     self.pending_add = True
                     return [{"side": "buy", "symbol": SYMBOL,
@@ -266,8 +299,11 @@ class Bot:
             close > sma and ef > es and RSI_MIN <= self.rsi <= RSI_MAX
             and sma_lag is not None and sma >= sma_lag * (1.0 + SLOPE_MIN_PCT)
             and ef - es >= close * GAP_MIN_PCT
-            and not (CONFIRM_N > 0 and len(self.highs) > CONFIRM_N and close <= max(self.highs[-CONFIRM_N - 1:-1]))
+            and not (CONFIRM_N > 0 and len(self.highs) > CONFIRM_N and close <= max(self.highs[-CONFIRM_N - 1:-1]) * (1.0 + BREAK_MARGIN_PCT))
         )
+        if TREND_SMA2 > 0 and len(self.closes) >= TREND_SMA2:
+            # second trend filter, applied only once enough history exists
+            all_cond = all_cond and close > sum(self.closes[-TREND_SMA2:]) / TREND_SMA2
         if ROC_MIN_PCT > 0 and len(self.closes) > ROC_BARS:
             all_cond = all_cond and close >= self.closes[-ROC_BARS - 1] * (1.0 + ROC_MIN_PCT)
         edge = all_cond and not self.prev_all_cond
@@ -281,7 +317,7 @@ class Bot:
             strong_regime = sma >= sma_lag * (1.0 + REGIME_SLOPE_PCT)
             if not strong_regime and self.bar_no - self.last_cross_up > CROSS_WINDOW:
                 return []
-        notional = int(state_cash * INIT_FRAC)
+        notional = min(int(state_cash * INIT_FRAC), self.exposure_cap(state_equity))
         if notional < 1_000_000:
             return []
         self.pending_buy = True
